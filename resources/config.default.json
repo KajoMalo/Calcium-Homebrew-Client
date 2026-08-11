@@ -1,0 +1,23 @@
+{
+  "download_dir":          "./downloads",
+  "install_dir":           "./installed",
+  "log_file":              "./calcium.log",
+  "log_level":             "info",
+  "download_timeout_secs": 30,
+  "download_max_retries":  3,
+  "verify_hashes":         true,
+  "ui": {
+    "theme":          "dark",
+    "font_size":      16,
+    "show_nsfw":      false,
+    "reduced_motion": false
+  },
+  "repositories": [
+    {
+      "id":      "mock-local",
+      "name":    "Calcium Mock Repo (local)",
+      "url":     "file://resources/mock_repo/index.json",
+      "enabled": true
+    }
+  ]
+}

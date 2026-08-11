@@ -1,0 +1,237 @@
+name: Build Calcium Client
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+# ── Permissions ────────────────────────────────────────────────────────────────
+permissions:
+  contents: write   # needed to create GitHub Releases
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 1 – Windows desktop build
+  # ────────────────────────────────────────────────────────────────────────────
+  build-windows-desktop:
+    name: Windows Desktop Build
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # vcpkg is pre-installed on GitHub-hosted Windows runners.
+      # Install the dependencies Calcium needs.
+      - name: Install dependencies via vcpkg
+        shell: pwsh
+        run: |
+          vcpkg install curl:x64-windows zlib:x64-windows sdl2:x64-windows sdl2-ttf:x64-windows
+
+      - name: Configure CMake (Desktop, Release)
+        shell: pwsh
+        run: |
+          cmake -B build `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCALCIUM_BUILD_DESKTOP=ON `
+            -DCALCIUM_BUILD_TESTS=ON `
+            -DCALCIUM_ENABLE_CURL=ON `
+            -DCALCIUM_PLATFORM_PS4=OFF `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: Run tests
+        shell: pwsh
+        working-directory: build
+        run: ctest -C Release --output-on-failure
+
+      # Gather the executable and required runtime DLLs into a staging folder.
+      - name: Stage release artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build\bin\Release\calcium-client.exe dist\
+          # Copy SDL2 and SDL2_ttf DLLs shipped by vcpkg.
+          Get-ChildItem "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin" `
+            -Include "SDL2.dll","SDL2_ttf.dll","libcurl.dll","zlib1.dll","freetype.dll" `
+            -Recurse | Copy-Item -Destination dist\
+          # Bundle the resources folder.
+          Copy-Item -Recurse resources dist\resources
+          # Default config.
+          Copy-Item resources\config.default.json dist\config.json
+
+      - name: Zip desktop artifact
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\* `
+            -DestinationPath calcium-client-windows-desktop.zip
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: calcium-client-windows-desktop
+          path: calcium-client-windows-desktop.zip
+          retention-days: 30
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 2 – PS4 homebrew .pkg build
+  # Uses the OpenOrbis toolchain.
+  # ────────────────────────────────────────────────────────────────────────────
+  build-ps4-pkg:
+    name: PS4 Homebrew PKG Build
+    runs-on: ubuntu-latest
+
+    env:
+      OO_PS4_TOOLCHAIN: /opt/OpenOrbis/PS4Toolchain
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Install build tools ────────────────────────────────────────────────
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake build-essential git curl ca-certificates \
+            clang lld zlib1g-dev python3 python3-pip
+
+      # ── Download OpenOrbis PS4 toolchain ─────────────────────────────────
+      # The toolchain is a self-contained archive available from the
+      # OpenOrbis project. No secrets needed for this download.
+      - name: Download OpenOrbis PS4 Toolchain
+        run: |
+          mkdir -p /opt/OpenOrbis
+          curl -sSL \
+            "https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.2/toolchain.tar.gz" \
+            -o /tmp/toolchain.tar.gz
+          tar -xzf /tmp/toolchain.tar.gz -C /opt/OpenOrbis/
+          echo "Toolchain installed at $OO_PS4_TOOLCHAIN"
+          ls "$OO_PS4_TOOLCHAIN"
+
+      # ── Configure for PS4 ─────────────────────────────────────────────────
+      - name: Configure CMake (PS4, Release)
+        run: |
+          cmake -B build-ps4 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCALCIUM_PLATFORM_PS4=ON \
+            -DCALCIUM_BUILD_DESKTOP=OFF \
+            -DCALCIUM_ENABLE_CURL=OFF \
+            -DCALCIUM_BUILD_TESTS=OFF \
+            -DCMAKE_TOOLCHAIN_FILE="$OO_PS4_TOOLCHAIN/cmake/toolchain.cmake"
+
+      - name: Build PS4 ELF
+        run: cmake --build build-ps4 --parallel
+
+      # ── Package into .pkg ─────────────────────────────────────────────────
+      # Uses the create-fself and create-pkg tools bundled with OpenOrbis.
+      - name: Build PS4 .pkg
+        env:
+          # The signing passphrase / fake PKG key — stored as an Actions secret.
+          PKG_PASSPHRASE: ${{ secrets.TOKEN_SECRET }}
+        run: |
+          FSELF="$OO_PS4_TOOLCHAIN/bin/linux/create-fself"
+          CREATEPKG="$OO_PS4_TOOLCHAIN/bin/linux/create-pkg"
+
+          # Ensure binaries are executable.
+          chmod +x "$FSELF" "$CREATEPKG"
+
+          # Create the signed FSELF from the built ELF.
+          "$FSELF" \
+            --in  build-ps4/bin/calcium-client \
+            --out pkg_root/Image0/eboot.bin \
+            --paid 0x3800000000000011
+
+          # Populate the pkg_root layout expected by create-pkg.
+          mkdir -p pkg_root/Image0/sce_sys
+
+          # param.sfo – written by the toolchain's sfo helper,
+          # or we use a pre-made one bundled in resources/.
+          if [ -f resources/sce_sys/param.sfo ]; then
+            cp resources/sce_sys/param.sfo pkg_root/Image0/sce_sys/param.sfo
+          else
+            # Generate a minimal param.sfo with the toolchain helper.
+            python3 "$OO_PS4_TOOLCHAIN/scripts/param_sfo.py" \
+              --title "Calcium Client" \
+              --title-id "CALC00001" \
+              --app-ver "01.00" \
+              --sdk-ver "05.050000" \
+              --output pkg_root/Image0/sce_sys/param.sfo
+          fi
+
+          # App icon (512×512 PNG).
+          if [ -f resources/icons/calcium_icon0.png ]; then
+            cp resources/icons/calcium_icon0.png pkg_root/Image0/sce_sys/icon0.png
+          fi
+
+          # Copy runtime resources (themes, default config, mock repo).
+          cp -r resources/themes   pkg_root/Image0/themes
+          cp -r resources/mock_repo pkg_root/Image0/mock_repo
+          cp resources/config.default.json pkg_root/Image0/config.json
+
+          # Build the .pkg.
+          "$CREATEPKG" \
+            --in  pkg_root \
+            --out calcium-client.pkg \
+            --content-id "UP0001-CALC00001_00-CALCIUMCLIENT0000"
+
+          echo "PKG built: $(ls -lh calcium-client.pkg)"
+
+      - name: Upload PS4 PKG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: calcium-client-ps4-pkg
+          path: calcium-client.pkg
+          retention-days: 30
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 3 – Create a GitHub Release on version tags (v*)
+  # Attaches both the Windows zip and the PS4 .pkg.
+  # ────────────────────────────────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ build-windows-desktop, build-ps4-pkg ]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: calcium-client-windows-desktop
+
+      - name: Download PS4 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: calcium-client-ps4-pkg
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.TOKEN_SECRET }}
+          name: "Calcium Client ${{ github.ref_name }}"
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |
+            ## Calcium Client ${{ github.ref_name }}
+
+            ### Downloads
+            | File | Description |
+            |---|---|
+            | `calcium-client-windows-desktop.zip` | Windows desktop build (SDL2 GUI) |
+            | `calcium-client.pkg` | PS4 homebrew package |
+
+            ### Installation
+            **Windows:** Extract the zip and run `calcium-client.exe`.
+            **PS4:** Install `calcium-client.pkg` via your homebrew package installer.
+
+            See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for full documentation.
+          files: |
+            calcium-client-windows-desktop.zip
+            calcium-client.pkg
