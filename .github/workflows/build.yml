@@ -291,12 +291,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "OO_PS4_TOOLCHAIN=$OO_ROOT" >> "$GITHUB_ENV"
+          # The release tarball was extracted with
+          # --strip-components=1, but its actual toolchain root is
+          # nested one level deeper, at PS4Toolchain/. Point
+          # OO_PS4_TOOLCHAIN there so every later step (bin/
+          # lookups, include/, lib/, create-eboot) resolves
+          # correctly.
 
-          echo "$OO_ROOT/bin" >> "$GITHUB_PATH"
+          echo "OO_PS4_TOOLCHAIN=$OO_ROOT/PS4Toolchain" >> "$GITHUB_ENV"
 
-          if [ -d "$OO_ROOT/bin/linux" ]; then
-            echo "$OO_ROOT/bin/linux" >> "$GITHUB_PATH"
+          echo "$OO_ROOT/PS4Toolchain/bin" >> "$GITHUB_PATH"
+
+          if [ -d "$OO_ROOT/PS4Toolchain/bin/linux" ]; then
+            echo "$OO_ROOT/PS4Toolchain/bin/linux" >> "$GITHUB_PATH"
           fi
 
       # --------------------------------------------------------
