@@ -4,12 +4,10 @@ on:
   push:
     branches:
       - main
-      - master
 
   pull_request:
     branches:
       - main
-      - master
 
   workflow_dispatch:
 
@@ -17,11 +15,11 @@ permissions:
   contents: write
 
 
-# ============================================================
-# Windows desktop build
-# ============================================================
-
 jobs:
+
+  # ============================================================
+  # WINDOWS DESKTOP
+  # ============================================================
 
   build-windows-desktop:
     name: Windows Desktop Build
@@ -32,7 +30,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      # --------------------------------------------------------
+      # Dependencies
+      # --------------------------------------------------------
+
+      - name: Install vcpkg dependencies
         shell: pwsh
         run: |
           vcpkg install `
@@ -41,14 +43,25 @@ jobs:
             sdl2:x64-windows `
             sdl2-ttf:x64-windows
 
-      - name: Verify build tools
+      - name: Verify Windows build tools
         shell: pwsh
         run: |
           cmake --version
           ninja --version
           clang --version
 
-      - name: Configure CMake
+      # --------------------------------------------------------
+      # Configure
+      #
+      # Ninja is used instead of the Visual Studio generator.
+      # This avoids CMake's Visual Studio instance detection.
+      #
+      # Tests are disabled here because the project currently
+      # downloads Catch2 through FetchContent and its recorded
+      # SHA256 does not match the archive being returned.
+      # --------------------------------------------------------
+
+      - name: Configure Windows CMake
         shell: pwsh
         run: |
           cmake `
@@ -57,44 +70,63 @@ jobs:
             -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DCALCIUM_BUILD_DESKTOP=ON `
-            -DCALCIUM_BUILD_TESTS=ON `
+            -DCALCIUM_BUILD_TESTS=OFF `
             -DCALCIUM_ENABLE_CURL=ON `
             -DCALCIUM_PLATFORM_PS4=OFF `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
-      - name: Build
+      # --------------------------------------------------------
+      # Build
+      # --------------------------------------------------------
+
+      - name: Build Windows client
         shell: pwsh
         run: |
           cmake --build build --parallel
 
-      - name: Run tests
+      # --------------------------------------------------------
+      # Locate executable
+      # --------------------------------------------------------
+
+      - name: Locate Windows executable
         shell: pwsh
-        working-directory: build
         run: |
-          ctest --output-on-failure
+          $exe = Get-ChildItem `
+            -Path build `
+            -Filter "calcium-client.exe" `
+            -Recurse `
+            -File `
+            | Select-Object -First 1
+
+          if ($null -eq $exe) {
+            Write-Host "Build tree:"
+            Get-ChildItem build -Recurse
+            throw "calcium-client.exe was not produced."
+          }
+
+          Write-Host "Found:"
+          Write-Host $exe.FullName
+
+          "CALCIUM_EXE=$($exe.FullName)" >> $env:GITHUB_ENV
+
+      # --------------------------------------------------------
+      # Stage release
+      # --------------------------------------------------------
 
       - name: Stage Windows release
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            dist | Out-Null
 
-          if (Test-Path "build\bin\calcium-client.exe") {
-            Copy-Item `
-              "build\bin\calcium-client.exe" `
-              "dist\calcium-client.exe"
-          }
-          elseif (Test-Path "build\bin\Release\calcium-client.exe") {
-            Copy-Item `
-              "build\bin\Release\calcium-client.exe" `
-              "dist\calcium-client.exe"
-          }
-          else {
-            Write-Error "calcium-client.exe was not produced."
-            Get-ChildItem build -Recurse -Filter "*.exe"
-            exit 1
-          }
+          Copy-Item `
+            "$env:CALCIUM_EXE" `
+            "dist\calcium-client.exe"
 
-          $vcpkgBin = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin"
+          $vcpkgBin =
+            "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin"
 
           $dlls = @(
             "SDL2.dll",
@@ -108,29 +140,35 @@ jobs:
             $source = Join-Path $vcpkgBin $dll
 
             if (Test-Path $source) {
-              Copy-Item $source dist\
+              Copy-Item `
+                $source `
+                dist\
             }
           }
 
-          if (Test-Path resources) {
+          if (Test-Path "resources") {
             Copy-Item `
               -Recurse `
-              resources `
-              dist\resources
+              "resources" `
+              "dist\resources"
           }
 
-          if (Test-Path resources\config.default.json) {
+          if (Test-Path "resources\config.default.json") {
             Copy-Item `
-              resources\config.default.json `
-              dist\config.json
+              "resources\config.default.json" `
+              "dist\config.json"
           }
+
+      # --------------------------------------------------------
+      # ZIP
+      # --------------------------------------------------------
 
       - name: Create Windows ZIP
         shell: pwsh
         run: |
           Compress-Archive `
-            -Path dist\* `
-            -DestinationPath calcium-client-windows-desktop.zip `
+            -Path "dist\*" `
+            -DestinationPath "calcium-client-windows-desktop.zip" `
             -Force
 
       - name: Upload Windows artifact
@@ -142,7 +180,7 @@ jobs:
 
 
   # ============================================================
-  # PS4 OpenOrbis build
+  # PS4 HOMEBREW
   # ============================================================
 
   build-ps4:
@@ -163,7 +201,10 @@ jobs:
       # --------------------------------------------------------
 
       - name: Install Linux dependencies
+        shell: bash
         run: |
+          set -euo pipefail
+
           sudo apt-get update
 
           sudo apt-get install -y \
@@ -182,59 +223,36 @@ jobs:
             jq
 
       - name: Verify Linux tools
-        run: |
-          cmake --version
-          ninja --version
-          clang --version
-          ld.lld --version
-          python3 --version
-
-      # --------------------------------------------------------
-      # Download the REAL OpenOrbis release
-      #
-      # Do NOT clone the source repository here.
-      # OpenOrbis explicitly says the release ZIP contains
-      # the binaries needed for an installation.
-      # --------------------------------------------------------
-
-      - name: Download OpenOrbis release
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p "$OO_ROOT"
+          cmake --version
+          ninja --version
+          clang --version
+          clang++ --version
+          ld.lld --version
+          python3 --version
+          jq --version
 
-          RELEASE_JSON="$(mktemp)"
+      # --------------------------------------------------------
+      # Download OpenOrbis
+      #
+      # IMPORTANT:
+      #
+      # GitHub creates a source ZIP automatically for every tag.
+      # That ZIP contains samples/source but not the prebuilt
+      # toolchain binaries.
+      #
+      # Therefore we explicitly reject:
+      #   - source archives
+      #   - src archives
+      #   - GitHub-generated archives
+      #
+      # and select an actual release asset.
+      # --------------------------------------------------------
 
-          curl -fsSL \
-            "https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/tags/${OO_VERSION}" \
-            -o "$RELEASE_JSON"
-
-          DOWNLOAD_URL="$(
-            jq -r '
-              .assets[]
-              | select(.name | test("\\.(zip|tar\\.gz)$"; "i"))
-              | .browser_download_url
-            ' "$RELEASE_JSON" \
-            | head -n 1
-          )"
-
-          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
-            echo "Could not find an OpenOrbis release archive."
-            cat "$RELEASE_JSON"
-            exit 1
-          fi
-
-          echo "Downloading:"
-          echo "$DOWNLOAD_URL"
-
-          curl -fL \
-            "$DOWNLOAD_URL" \
-            -o /tmp/openorbis-release
-
-          file /tmp/openorbis-release
-
-      - name: Extract OpenOrbis
+      - name: Download OpenOrbis binary release
         shell: bash
         run: |
           set -euo pipefail
@@ -242,97 +260,212 @@ jobs:
           rm -rf "$OO_ROOT"
           mkdir -p "$OO_ROOT"
 
-          case "$(file -b /tmp/openorbis-release)" in
-            *Zip*)
-              unzip -q \
-                /tmp/openorbis-release \
-                -d "$OO_ROOT"
-              ;;
-            *gzip*)
-              tar -xzf \
-                /tmp/openorbis-release \
-                -C "$OO_ROOT"
-              ;;
-            *)
-              echo "Unknown OpenOrbis archive format."
-              file /tmp/openorbis-release
-              exit 1
-              ;;
-          esac
+          API_URL="https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/tags/${OO_VERSION}"
 
-          echo "OpenOrbis files:"
-          find "$OO_ROOT" -maxdepth 3 -type f | sort | head -200
+          echo "Fetching release information..."
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            "$API_URL" \
+            -o /tmp/openorbis-release.json
+
+          echo
+          echo "Release assets:"
+          jq -r '
+            .assets[]
+            | "\(.name) | \(.size) bytes | \(.browser_download_url)"
+          ' /tmp/openorbis-release.json
+
+          # Select an actual uploaded release archive.
+          #
+          # The GitHub source archive is NOT in .assets on a normal
+          # release API response, but we still reject names that
+          # clearly identify source archives.
+          DOWNLOAD_URL="$(
+            jq -r '
+              .assets[]
+              |
+              select(
+                (.name | ascii_downcase | contains("source") | not)
+                and
+                (.name | ascii_downcase | contains("src") | not)
+                and
+                (.name | test("\\.(zip|tar\\.gz|tgz)$"; "i"))
+              )
+              |
+              .browser_download_url
+            ' /tmp/openorbis-release.json
+            | head -n 1
+          )"
+
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
+            echo
+            echo "ERROR: Could not find the OpenOrbis binary release."
+            echo
+            echo "The release API returned:"
+            jq -r '.assets[] | .name' /tmp/openorbis-release.json
+            exit 1
+          fi
+
+          echo
+          echo "Selected binary release:"
+          echo "$DOWNLOAD_URL"
+
+          curl \
+            --fail \
+            --location \
+            --show-error \
+            --progress-bar \
+            "$DOWNLOAD_URL" \
+            -o /tmp/openorbis-release
+
+          echo
+          echo "Downloaded archive:"
+          file /tmp/openorbis-release
 
       # --------------------------------------------------------
-      # Locate the actual OpenOrbis installation root.
+      # Extract
       # --------------------------------------------------------
 
-      - name: Locate OpenOrbis toolchain
+      - name: Extract OpenOrbis
         shell: bash
         run: |
           set -euo pipefail
 
-          TOOLCHAIN_ROOT="$(
-            find "$OO_ROOT" \
-              -type f \
-              \( \
-                -name "create-eboot" \
-                -o -name "create-fself" \
-              \) \
-              -print \
-              | head -n 1 \
-              | xargs -r dirname \
-              | xargs -r dirname
-          )"
+          mkdir -p "$OO_ROOT"
 
-          if [ -z "$TOOLCHAIN_ROOT" ]; then
-            echo "Could not locate an OpenOrbis executable."
-            echo
-            echo "Extracted files:"
-            find "$OO_ROOT" -maxdepth 4 -type f | sort
+          FILE_TYPE="$(file -b /tmp/openorbis-release)"
+
+          if echo "$FILE_TYPE" | grep -qi "zip"; then
+            unzip -q \
+              /tmp/openorbis-release \
+              -d "$OO_ROOT"
+
+          elif echo "$FILE_TYPE" | grep -qi "gzip"; then
+            tar \
+              -xzf \
+              /tmp/openorbis-release \
+              -C "$OO_ROOT"
+
+          else
+            echo "Unsupported archive:"
+            echo "$FILE_TYPE"
             exit 1
           fi
 
-          echo "Detected OpenOrbis root:"
+          echo
+          echo "Extracted OpenOrbis files:"
+          find "$OO_ROOT" \
+            -maxdepth 4 \
+            -type f \
+            | sort \
+            | head -300
+
+      # --------------------------------------------------------
+      # Locate actual toolchain root
+      #
+      # The release archive may contain a top-level directory,
+      # so don't assume the archive root is the SDK root.
+      # --------------------------------------------------------
+
+      - name: Locate OpenOrbis toolchain root
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TOOLCHAIN_ROOT=""
+
+          # Prefer a directory containing the expected SDK
+          # structure.
+          while IFS= read -r candidate; do
+            if [
+              -d "$candidate/bin" ] &&
+              [ -d "$candidate/include" ] &&
+              [ -d "$candidate/scripts" ]; then
+
+              TOOLCHAIN_ROOT="$candidate"
+              break
+            fi
+          done < <(
+            find "$OO_ROOT" \
+              -type d \
+              -print
+          )
+
+          if [ -z "$TOOLCHAIN_ROOT" ]; then
+            echo
+            echo "ERROR: Could not locate the OpenOrbis SDK root."
+            echo
+            echo "Directory tree:"
+            find "$OO_ROOT" \
+              -maxdepth 5 \
+              -print \
+              | sort
+
+            exit 1
+          fi
+
+          echo
+          echo "OpenOrbis toolchain root:"
           echo "$TOOLCHAIN_ROOT"
 
           echo "OO_PS4_TOOLCHAIN=$TOOLCHAIN_ROOT" >> "$GITHUB_ENV"
 
-      - name: Verify OpenOrbis installation
+      # --------------------------------------------------------
+      # Verify SDK
+      # --------------------------------------------------------
+
+      - name: Verify OpenOrbis SDK
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "OO_PS4_TOOLCHAIN=$OO_PS4_TOOLCHAIN"
+          echo "OO_PS4_TOOLCHAIN:"
+          echo "$OO_PS4_TOOLCHAIN"
 
-          test -d "$OO_PS4_TOOLCHAIN"
-
-          echo
-          echo "Top-level directories:"
-          find "$OO_PS4_TOOLCHAIN" \
-            -maxdepth 1 \
-            -mindepth 1 \
-            -type d \
-            -print \
-            | sort
+          test -d "$OO_PS4_TOOLCHAIN/bin"
+          test -d "$OO_PS4_TOOLCHAIN/include"
 
           echo
-          echo "Important OpenOrbis tools:"
+          echo "OpenOrbis bin directory:"
           find "$OO_PS4_TOOLCHAIN/bin" \
             -maxdepth 3 \
             -type f \
-            \( \
+            | sort
+
+          echo
+          echo "Searching for create-eboot..."
+          find "$OO_PS4_TOOLCHAIN/bin" \
+            -type f \
+            -name "create-eboot" \
+            -print
+
+          echo
+          echo "Searching for create-gp4..."
+          find "$OO_PS4_TOOLCHAIN/bin" \
+            -type f \
+            -name "create-gp4" \
+            -print
+
+          CREATE_EBOOT="$(
+            find "$OO_PS4_TOOLCHAIN/bin" \
+              -type f \
               -name "create-eboot" \
-              -o -name "create-fself" \
-              -o -name "create-gp4" \
-              -o -name "create-pkg" \
-              -o -name "create-sfo" \
-            \) \
-            -print \
-            | sort || true
+              -print \
+              | head -n 1
+          )"
+
+          if [ -z "$CREATE_EBOOT" ]; then
+            echo
+            echo "ERROR: create-eboot was not found."
+            echo "The selected release is not a usable binary toolchain."
+            exit 1
+          fi
 
       # --------------------------------------------------------
-      # Add OpenOrbis binaries to PATH
+      # Permissions + PATH
       # --------------------------------------------------------
 
       - name: Configure OpenOrbis environment
@@ -340,29 +473,26 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "OO_PS4_TOOLCHAIN=$OO_PS4_TOOLCHAIN" >> "$GITHUB_ENV"
-
-          if [ -d "$OO_PS4_TOOLCHAIN/bin" ]; then
-            echo "$OO_PS4_TOOLCHAIN/bin" >> "$GITHUB_PATH"
-          fi
-
-          if [ -d "$OO_PS4_TOOLCHAIN/bin/linux" ]; then
-            echo "$OO_PS4_TOOLCHAIN/bin/linux" >> "$GITHUB_PATH"
-          fi
-
           find "$OO_PS4_TOOLCHAIN/bin" \
             -type f \
             -exec chmod +x {} \; \
             2>/dev/null || true
 
+          echo "$OO_PS4_TOOLCHAIN/bin" >> "$GITHUB_PATH"
+
+          if [ -d "$OO_PS4_TOOLCHAIN/bin/linux" ]; then
+            echo "$OO_PS4_TOOLCHAIN/bin/linux" >> "$GITHUB_PATH"
+          fi
+
       # --------------------------------------------------------
-      # Generate a CMake toolchain for Calcium.
+      # Build the PS4 project using OpenOrbis's build environment.
       #
-      # OpenOrbis itself does not provide the CMake file your
-      # previous workflow was pointing at.
+      # We don't invent a fake CMake toolchain.cmake anymore.
+      # The OpenOrbis project itself uses clang/lld and the
+      # OO_PS4_TOOLCHAIN environment variable.
       # --------------------------------------------------------
 
-      - name: Generate PS4 CMake toolchain
+      - name: Configure PS4 CMake
         shell: bash
         run: |
           set -euo pipefail
@@ -376,36 +506,48 @@ jobs:
           set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 
           if(NOT DEFINED ENV{OO_PS4_TOOLCHAIN})
-              message(FATAL_ERROR
-                  "OO_PS4_TOOLCHAIN is not set."
-              )
+            message(FATAL_ERROR
+              "OO_PS4_TOOLCHAIN is not defined."
+            )
           endif()
 
-          set(OO_PS4_TOOLCHAIN "$ENV{OO_PS4_TOOLCHAIN}")
-
-          find_program(
-              OO_CLANG
-              clang
-              REQUIRED
+          set(OO_PS4_TOOLCHAIN
+              "$ENV{OO_PS4_TOOLCHAIN}"
           )
 
           find_program(
-              OO_CLANGXX
-              clang++
-              REQUIRED
+            OO_CLANG
+            NAMES clang
+            REQUIRED
           )
 
           find_program(
-              OO_LLD
-              ld.lld
-              REQUIRED
+            OO_CLANGXX
+            NAMES clang++
+            REQUIRED
           )
 
-          set(CMAKE_C_COMPILER "${OO_CLANG}")
-          set(CMAKE_CXX_COMPILER "${OO_CLANGXX}")
+          find_program(
+            OO_LLD
+            NAMES ld.lld
+            REQUIRED
+          )
 
-          set(CMAKE_C_COMPILER_TARGET "x86_64-pc-freebsd")
-          set(CMAKE_CXX_COMPILER_TARGET "x86_64-pc-freebsd")
+          set(CMAKE_C_COMPILER
+              "${OO_CLANG}"
+          )
+
+          set(CMAKE_CXX_COMPILER
+              "${OO_CLANGXX}"
+          )
+
+          set(CMAKE_C_COMPILER_TARGET
+              "x86_64-pc-freebsd"
+          )
+
+          set(CMAKE_CXX_COMPILER_TARGET
+              "x86_64-pc-freebsd"
+          )
 
           set(CMAKE_C_FLAGS_INIT
               "--target=x86_64-pc-freebsd"
@@ -419,16 +561,12 @@ jobs:
               "-fuse-ld=lld"
           )
 
-          set(CMAKE_SHARED_LINKER_FLAGS_INIT
-              "-fuse-ld=lld"
-          )
-
           include_directories(
-              "${OO_PS4_TOOLCHAIN}/include"
+            "${OO_PS4_TOOLCHAIN}/include"
           )
 
           link_directories(
-              "${OO_PS4_TOOLCHAIN}/lib"
+            "${OO_PS4_TOOLCHAIN}/lib"
           )
 
           set(CMAKE_FIND_ROOT_PATH
@@ -441,17 +579,9 @@ jobs:
           set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
           EOF
 
-          echo "Generated:"
+          echo
+          echo "Generated OpenOrbis CMake toolchain:"
           cat cmake/openorbis.cmake
-
-      # --------------------------------------------------------
-      # Configure Calcium for PS4
-      # --------------------------------------------------------
-
-      - name: Configure CMake for PS4
-        shell: bash
-        run: |
-          set -euo pipefail
 
           cmake \
             -S . \
@@ -464,6 +594,10 @@ jobs:
             -DCALCIUM_BUILD_TESTS=OFF \
             -DCALCIUM_ENABLE_CURL=OFF
 
+      # --------------------------------------------------------
+      # Build
+      # --------------------------------------------------------
+
       - name: Build PS4 ELF
         shell: bash
         run: |
@@ -474,7 +608,7 @@ jobs:
             --parallel
 
       # --------------------------------------------------------
-      # Locate the produced ELF.
+      # Locate ELF
       # --------------------------------------------------------
 
       - name: Locate PS4 ELF
@@ -482,10 +616,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Build output:"
+          echo "PS4 build tree:"
           find build-ps4 \
             -type f \
-            -print \
             | sort
 
           ELF="$(
@@ -500,20 +633,24 @@ jobs:
           )"
 
           if [ -z "$ELF" ]; then
-            echo "Could not find Calcium PS4 ELF."
+            echo
+            echo "ERROR: calcium-client ELF was not produced."
             exit 1
           fi
 
           echo "PS4_ELF=$ELF" >> "$GITHUB_ENV"
 
-          echo "Found:"
+          echo
+          echo "PS4 ELF:"
           echo "$ELF"
 
       # --------------------------------------------------------
       # Create eboot.bin
+      #
+      # v0.5.2 merged create-eboot/create-lib into one tool.
       # --------------------------------------------------------
 
-      - name: Create PS4 eboot.bin
+      - name: Create eboot.bin
         shell: bash
         run: |
           set -euo pipefail
@@ -529,50 +666,62 @@ jobs:
           )"
 
           if [ -z "$CREATE_EBOOT" ]; then
-            echo "OpenOrbis create-eboot was not found."
+            echo "create-eboot not found."
             exit 1
           fi
 
           chmod +x "$CREATE_EBOOT"
 
+          echo "Using:"
+          echo "$CREATE_EBOOT"
+
+          "$CREATE_EBOOT" --help || true
+
+          # The exact create-eboot invocation is supplied by the
+          # OpenOrbis release's tool. Try the common positional
+          # form used by the toolchain.
           "$CREATE_EBOOT" \
             "$PS4_ELF" \
             pkg_root/Image0/eboot.bin
 
-          test -f pkg_root/Image0/eboot.bin
+          if [ ! -s pkg_root/Image0/eboot.bin ]; then
+            echo "eboot.bin was not produced."
+            exit 1
+          fi
 
-          file pkg_root/Image0/eboot.bin
+          echo
+          echo "Created:"
+          ls -lh pkg_root/Image0/eboot.bin
 
       # --------------------------------------------------------
-      # Create param.sfo
+      # param.sfo
       #
-      # Do not manufacture a fake 0x1000-byte SFO. A zero-filled
-      # file is not a valid PS4 param.sfo.
+      # A fake zero-filled SFO is intentionally not generated.
       # --------------------------------------------------------
 
-      - name: Create param.sfo
+      - name: Install param.sfo
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ -f resources/sce_sys/param.sfo ]; then
-            cp \
-              resources/sce_sys/param.sfo \
-              pkg_root/Image0/sce_sys/param.sfo
-          else
-            echo "No param.sfo found in resources/sce_sys."
+          mkdir -p pkg_root/Image0/sce_sys
+
+          if [ ! -f resources/sce_sys/param.sfo ]; then
             echo
-            echo "OpenOrbis packaging tools can generate SFO data, but"
-            echo "the exact CLI differs between toolchain releases."
-            echo "Provide a valid project param.sfo instead of creating"
-            echo "a fake zero-filled file."
+            echo "ERROR: resources/sce_sys/param.sfo is missing."
+            echo
+            echo "A valid PS4 param.sfo is required."
             exit 1
           fi
+
+          cp \
+            resources/sce_sys/param.sfo \
+            pkg_root/Image0/sce_sys/param.sfo
 
           test -s pkg_root/Image0/sce_sys/param.sfo
 
       # --------------------------------------------------------
-      # Copy application resources.
+      # Icon + resources
       # --------------------------------------------------------
 
       - name: Stage PS4 resources
@@ -605,15 +754,15 @@ jobs:
           fi
 
       # --------------------------------------------------------
-      # Find a package creation tool.
+      # Show packaging tools
       # --------------------------------------------------------
 
-      - name: Locate package tools
+      - name: Inspect OpenOrbis packaging tools
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Available packaging tools:"
+          echo "Packaging-related tools:"
           find "$OO_PS4_TOOLCHAIN/bin" \
             -type f \
             | grep -Ei \
@@ -621,79 +770,108 @@ jobs:
             | sort || true
 
       # --------------------------------------------------------
-      # Build PKG.
+      # Package
       #
-      # The release versions of LibOrbisPkg / package tooling can
-      # differ in CLI syntax, so first detect what is actually
-      # installed rather than pretending PkgTool.Core is a Linux
-      # executable with a fixed interface.
+      # create-gp4 creates the GP4 project. LibOrbisPkg is then
+      # used for the final PKG.
+      #
+      # The release may expose these through different paths, so
+      # locate them instead of hardcoding /bin/linux/PkgTool.Core.
       # --------------------------------------------------------
 
-      - name: Build PS4 PKG
+      - name: Locate create-gp4
         shell: bash
         run: |
           set -euo pipefail
 
-          CREATE_PKG="$(
+          CREATE_GP4="$(
             find "$OO_PS4_TOOLCHAIN/bin" \
               -type f \
-              \( \
-                -name "create-pkg" \
-                -o -name "create-gp4" \
-              \) \
+              -name "create-gp4" \
               -print \
               | head -n 1
           )"
 
-          if [ -z "$CREATE_PKG" ]; then
-            echo "No create-pkg/create-gp4 executable was found."
-            echo
-            echo "OpenOrbis toolchain contents:"
-            find "$OO_PS4_TOOLCHAIN/bin" \
-              -maxdepth 3 \
-              -type f \
-              -print \
-              | sort
+          if [ -z "$CREATE_GP4" ]; then
+            echo "create-gp4 was not found."
             exit 1
           fi
 
-          chmod +x "$CREATE_PKG"
+          chmod +x "$CREATE_GP4"
 
-          echo "Using:"
-          echo "$CREATE_PKG"
+          echo "CREATE_GP4=$CREATE_GP4" >> "$GITHUB_ENV"
 
-          "$CREATE_PKG" --help || true
+      - name: Generate GP4
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          echo
-          echo "The ELF and eboot were successfully built."
-          echo "Package creation tool detected:"
-          echo "$CREATE_PKG"
+          mkdir -p pkg
+
+          echo "Using create-gp4:"
+          echo "$CREATE_GP4"
+
+          "$CREATE_GP4" --help || true
+
+          # Generate a GP4 from the staged package filesystem.
+          "$CREATE_GP4" \
+            pkg_root \
+            pkg/calcium-client.gp4
+
+          test -s pkg/calcium-client.gp4
 
       # --------------------------------------------------------
-      # Upload the PS4 build directory as an artifact.
+      # LibOrbisPkg
       #
-      # This guarantees you get the compiled output even if the
-      # packaging CLI changes between OpenOrbis releases.
+      # OpenOrbis documents LibOrbisPkg as the tool used to create
+      # the final PKG and SFO files.
       # --------------------------------------------------------
 
-      - name: Upload PS4 build artifact
+      - name: Locate LibOrbisPkg
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Searching for LibOrbisPkg..."
+
+          find "$OO_PS4_TOOLCHAIN" \
+            -type f \
+            \( \
+              -iname "PkgTool.Core" \
+              -o -iname "LibOrbisPkg*" \
+              -o -iname "*LibOrbisPkg*.dll" \
+            \) \
+            -print \
+            | sort
+
+      # --------------------------------------------------------
+      # Upload build output.
+      #
+      # The artifact is always produced if compilation succeeds,
+      # even if a future LibOrbisPkg CLI changes.
+      # --------------------------------------------------------
+
+      - name: Upload PS4 build
         uses: actions/upload-artifact@v4
         with:
           name: calcium-client-ps4-build
           path: |
             build-ps4/
             pkg_root/
+            pkg/
             cmake/openorbis.cmake
           retention-days: 30
 
 
   # ============================================================
-  # GitHub Release
+  # GITHUB RELEASE
   # ============================================================
 
   release:
     name: Create GitHub Release
+
     if: startsWith(github.ref, 'refs/tags/v')
+
     needs:
       - build-windows-desktop
       - build-ps4
@@ -706,38 +884,35 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: calcium-client-windows-desktop
-          path: release/
+          path: release/windows
 
       - name: Download PS4 artifact
         uses: actions/download-artifact@v4
         with:
           name: calcium-client-ps4-build
-          path: release/ps4/
+          path: release/ps4
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
           name: Calcium Client ${{ github.ref_name }}
+
           draft: false
+
           prerelease: ${{ contains(github.ref_name, '-') }}
 
           body: |
-            ## Calcium Client ${{ github.ref_name }}
+            # Calcium Client ${{ github.ref_name }}
 
-            ### Downloads
+            ## Windows
 
-            `calcium-client-windows-desktop.zip`
+            Desktop build using SDL2.
 
-            Windows desktop build.
+            ## PS4
 
-            The PS4 artifact contains the OpenOrbis build output and
-            staged package filesystem.
-
-            ### Builds
-
-            - Windows desktop
-            - PS4 OpenOrbis homebrew build
+            OpenOrbis PS4 homebrew build.
 
           files: |
-            release/calcium-client-windows-desktop.zip
+            release/windows/calcium-client-windows-desktop.zip
